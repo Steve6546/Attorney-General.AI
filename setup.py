@@ -1,0 +1,35 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="attorney_general",
+    version="1.0.0",
+    packages=find_packages(),
+    install_requires=[
+        "fastapi>=0.68.0",
+        "uvicorn>=0.15.0",
+        "pydantic>=1.8.2",
+        "sqlalchemy>=1.4.23",
+        "python-jose>=3.3.0",
+        "passlib>=1.7.4",
+        "python-multipart>=0.0.5",
+        "aiohttp>=3.8.1",
+        "langchain>=0.0.139",
+        "openai>=0.27.0",
+        "tiktoken>=0.3.0",
+        "pytest>=7.0.0",
+    ],
+    author="Attorney-General.AI Team",
+    author_email="info@attorney-general.ai",
+    description="نظام ذكاء اصطناعي متقدم للمساعدة القانونية والإدارية",
+    keywords="ai, legal, assistant, python",
+    url="https://github.com/Steve6546/Attorney-General.AI",
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Legal Industry",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+    ],
+    python_requires=">=3.8",
+)
