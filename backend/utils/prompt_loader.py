@@ -1,14 +1,17 @@
 """
-Attorney-General.AI - Prompt Loader Utility
+Attorney-General.AI - Prompt Loader
 
-This module provides utilities for loading and formatting prompts from files.
+This module provides utilities for loading prompts from files.
+It supports loading prompts from YAML, JSON, and text files.
 """
 
+import logging
 import os
 import yaml
 import json
 from typing import Dict, Any, Optional
-import logging
+
+from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,73 +20,110 @@ def load_prompt(prompt_name: str, prompt_dir: Optional[str] = None) -> str:
     Load a prompt from a file.
     
     Args:
-        prompt_name: The name of the prompt to load (without extension)
-        prompt_dir: Optional directory path where prompts are stored
+        prompt_name: Name of the prompt file
+        prompt_dir: Optional directory to load from
         
     Returns:
-        str: The loaded prompt text
+        str: Loaded prompt
+        
+    Raises:
+        FileNotFoundError: If prompt file not found
+        ValueError: If prompt format not supported
     """
-    # Default prompt directory if not specified
+    # Determine prompt directory
     if prompt_dir is None:
         prompt_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
     
-    # Try different file extensions
-    extensions = [".yaml", ".yml", ".json", ".txt"]
+    # Determine file path
+    file_path = os.path.join(prompt_dir, prompt_name)
     
-    for ext in extensions:
-        file_path = os.path.join(prompt_dir, f"{prompt_name}{ext}")
-        
-        if os.path.exists(file_path):
-            try:
-                # Load based on file extension
-                if ext in [".yaml", ".yml"]:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        prompt_data = yaml.safe_load(f)
-                        
-                    # Extract prompt text from YAML structure
-                    if isinstance(prompt_data, dict):
-                        return prompt_data.get("prompt", "")
-                    else:
-                        return str(prompt_data)
-                        
-                elif ext == ".json":
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        prompt_data = json.load(f)
-                        
-                    # Extract prompt text from JSON structure
-                    if isinstance(prompt_data, dict):
-                        return prompt_data.get("prompt", "")
-                    else:
-                        return str(prompt_data)
-                        
-                else:  # .txt or other
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        return f.read()
-                        
-            except Exception as e:
-                logger.error(f"Error loading prompt '{prompt_name}': {str(e)}")
-                return f"Error loading prompt: {str(e)}"
+    # Check if file exists
+    if not os.path.exists(file_path):
+        # Try adding extensions
+        for ext in [".yaml", ".yml", ".json", ".txt"]:
+            ext_path = file_path + ext
+            if os.path.exists(ext_path):
+                file_path = ext_path
+                break
     
-    # If prompt file not found, return a default message
-    logger.warning(f"Prompt '{prompt_name}' not found in {prompt_dir}")
-    return f"[Prompt '{prompt_name}' not found]"
+    # Check if file exists
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Prompt file not found: {prompt_name}")
+    
+    # Load based on file extension
+    _, ext = os.path.splitext(file_path)
+    
+    try:
+        if ext.lower() in [".yaml", ".yml"]:
+            return load_yaml_prompt(file_path)
+        elif ext.lower() == ".json":
+            return load_json_prompt(file_path)
+        elif ext.lower() == ".txt":
+            return load_text_prompt(file_path)
+        else:
+            # Try to load as text
+            return load_text_prompt(file_path)
+    except Exception as e:
+        logger.error(f"Error loading prompt {prompt_name}: {str(e)}")
+        raise
 
-def format_prompt(prompt_template: str, **kwargs) -> str:
+def load_yaml_prompt(file_path: str) -> str:
     """
-    Format a prompt template with the provided variables.
+    Load a prompt from a YAML file.
     
     Args:
-        prompt_template: The prompt template with placeholders
-        **kwargs: Variables to insert into the template
+        file_path: Path to YAML file
         
     Returns:
-        str: The formatted prompt
+        str: Loaded prompt
     """
-    try:
-        return prompt_template.format(**kwargs)
-    except KeyError as e:
-        logger.error(f"Missing key in prompt formatting: {str(e)}")
-        return f"Error formatting prompt: Missing key {str(e)}"
-    except Exception as e:
-        logger.error(f"Error formatting prompt: {str(e)}")
-        return f"Error formatting prompt: {str(e)}"
+    with open(file_path, "r") as f:
+        data = yaml.safe_load(f)
+    
+    # Check if it's a simple string
+    if isinstance(data, str):
+        return data
+    
+    # Check if it has a 'prompt' key
+    if isinstance(data, dict) and "prompt" in data:
+        return data["prompt"]
+    
+    # Convert to string
+    return yaml.dump(data)
+
+def load_json_prompt(file_path: str) -> str:
+    """
+    Load a prompt from a JSON file.
+    
+    Args:
+        file_path: Path to JSON file
+        
+    Returns:
+        str: Loaded prompt
+    """
+    with open(file_path, "r") as f:
+        data = json.load(f)
+    
+    # Check if it's a simple string
+    if isinstance(data, str):
+        return data
+    
+    # Check if it has a 'prompt' key
+    if isinstance(data, dict) and "prompt" in data:
+        return data["prompt"]
+    
+    # Convert to string
+    return json.dumps(data, indent=2)
+
+def load_text_prompt(file_path: str) -> str:
+    """
+    Load a prompt from a text file.
+    
+    Args:
+        file_path: Path to text file
+        
+    Returns:
+        str: Loaded prompt
+    """
+    with open(file_path, "r") as f:
+        return f.read()

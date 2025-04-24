@@ -1,179 +1,235 @@
 """
 Attorney-General.AI - Base Agent
 
-This module defines the base agent class that all specialized agents inherit from.
-It provides common functionality and interfaces for all agents.
+This module defines the base agent class for the Attorney-General.AI backend.
+It provides the foundation for specialized agents like the legal agent.
 """
 
-from typing import Dict, Any, List, Optional
 import logging
+from typing import Dict, Any, List, Optional, Union
 import uuid
-import asyncio
+import json
+from datetime import datetime
 
 from backend.core.llm_service import LLMService
+from backend.memory.memory_store import MemoryStore
 from backend.utils.prompt_loader import load_prompt
+from backend.tools.base_tool import BaseTool
 
 logger = logging.getLogger(__name__)
 
 class BaseAgent:
-    """Base class for all agents in the system."""
+    """Base agent class for Attorney-General.AI."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        session_id: str,
+        llm_service: Optional[LLMService] = None,
+        memory_store: Optional[MemoryStore] = None,
+        tools: Optional[List[BaseTool]] = None,
+        system_prompt: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None
+    ):
         """
         Initialize the base agent.
         
         Args:
-            config: Optional configuration dictionary
+            session_id: Session ID for the agent
+            llm_service: Optional LLM service
+            memory_store: Optional memory store
+            tools: Optional list of tools
+            system_prompt: Optional system prompt
+            config: Optional configuration
         """
+        self.session_id = session_id
+        self.llm_service = llm_service or LLMService()
+        self.memory_store = memory_store
+        self.tools = tools or []
+        self.system_prompt = system_prompt
         self.config = config or {}
-        self.agent_type = "base_agent"
-        self.capabilities = []
-        self.llm_service = LLMService()
-        self.tools = {}
+        
+        # Initialize agent state
+        self.conversation_history = []
+        self.last_response = None
+        self.metadata = {}
     
-    async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+    async def process_message(self, message: str) -> str:
         """
-        Process a request and return a response.
+        Process a user message and generate a response.
         
         Args:
-            request: The request dictionary
+            message: User message
             
         Returns:
-            Dict[str, Any]: The response dictionary
+            str: Agent response
         """
-        # This method should be overridden by subclasses
-        return {
-            "status": "error",
-            "data": "Method not implemented in base class"
-        }
+        # Add message to conversation history
+        self.conversation_history.append({
+            "role": "user",
+            "content": message,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        # Store in memory if memory store is available
+        if self.memory_store:
+            await self.memory_store.add_memory(
+                session_id=self.session_id,
+                content=f"User: {message}",
+                importance=0.5,
+                memory_type="short_term"
+            )
+        
+        # Process message
+        response = await self._generate_response(message)
+        
+        # Add response to conversation history
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": response,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        # Store in memory if memory store is available
+        if self.memory_store:
+            await self.memory_store.add_memory(
+                session_id=self.session_id,
+                content=f"Assistant: {response}",
+                importance=0.5,
+                memory_type="short_term"
+            )
+        
+        self.last_response = response
+        return response
     
-    async def execute_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _generate_response(self, message: str) -> str:
         """
-        Execute a tool with the given parameters.
+        Generate a response to a user message.
         
         Args:
-            tool_name: The name of the tool to execute
-            params: The parameters to pass to the tool
+            message: User message
             
         Returns:
-            Dict[str, Any]: The tool execution result
+            str: Generated response
         """
-        if tool_name not in self.tools:
-            return {
-                "status": "error",
-                "data": f"Tool '{tool_name}' not found"
-            }
+        # This is a basic implementation that should be overridden by subclasses
+        prompt = self._build_prompt(message)
         
-        try:
-            tool = self.tools[tool_name]
-            result = await tool.execute(params)
-            return {
-                "status": "success",
-                "data": result
-            }
-        except Exception as e:
-            logger.error(f"Error executing tool '{tool_name}': {str(e)}")
-            return {
-                "status": "error",
-                "data": f"Error executing tool: {str(e)}"
-            }
-    
-    def register_tool(self, tool_name: str, tool_instance: Any) -> None:
-        """
-        Register a tool with the agent.
-        
-        Args:
-            tool_name: The name of the tool
-            tool_instance: The tool instance
-        """
-        self.tools[tool_name] = tool_instance
-    
-    def get_tool_descriptions(self) -> List[Dict[str, Any]]:
-        """
-        Get descriptions of all registered tools for LLM function calling.
-        
-        Returns:
-            List[Dict[str, Any]]: List of tool descriptions
-        """
-        tool_descriptions = []
-        
-        for tool_name, tool in self.tools.items():
-            if hasattr(tool, 'get_description'):
-                tool_descriptions.append(tool.get_description())
-        
-        return tool_descriptions
-    
-    async def generate_response(
-        self, 
-        prompt: str, 
-        system_message: Optional[str] = None
-    ) -> str:
-        """
-        Generate a response using the LLM service.
-        
-        Args:
-            prompt: The prompt to send to the LLM
-            system_message: Optional system message
-            
-        Returns:
-            str: The generated response
-        """
-        return await self.llm_service.generate_response(
+        response = await self.llm_service.generate_response_async(
             prompt=prompt,
-            system_message=system_message
+            max_tokens=1000,
+            temperature=0.7,
+            system_message=self.system_prompt
         )
+        
+        return response
     
-    async def generate_with_tools(
-        self,
-        prompt: str,
-        system_message: Optional[str] = None
-    ) -> Dict[str, Any]:
+    def _build_prompt(self, message: str) -> str:
         """
-        Generate a response with tool calling capabilities.
+        Build a prompt for the LLM.
         
         Args:
-            prompt: The prompt to send to the LLM
-            system_message: Optional system message
+            message: User message
             
         Returns:
-            Dict[str, Any]: The generated response with tool calls if any
+            str: Prompt for the LLM
         """
-        tool_descriptions = self.get_tool_descriptions()
+        # This is a basic implementation that should be overridden by subclasses
+        history_text = ""
         
-        return await self.llm_service.generate_with_tools(
-            prompt=prompt,
-            tools=tool_descriptions,
-            system_message=system_message
-        )
+        # Include relevant conversation history
+        for item in self.conversation_history[-10:]:  # Last 10 messages
+            role = item["role"]
+            content = item["content"]
+            history_text += f"{role.capitalize()}: {content}\n\n"
+        
+        prompt = f"{history_text}User: {message}\n\nAssistant:"
+        return prompt
     
-    async def handle_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def get_relevant_memories(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Handle tool calls from the LLM.
+        Get relevant memories for a query.
         
         Args:
-            tool_calls: List of tool calls from the LLM
+            query: Query text
+            limit: Maximum number of memories to return
             
         Returns:
-            List[Dict[str, Any]]: Results of the tool executions
+            List[Dict[str, Any]]: Relevant memories
         """
-        results = []
+        if not self.memory_store:
+            return []
         
-        for tool_call in tool_calls:
-            tool_name = tool_call.get('name')
-            arguments = tool_call.get('arguments', {})
-            
-            if isinstance(arguments, str):
-                try:
-                    # Parse JSON string arguments
-                    arguments = json.loads(arguments)
-                except:
-                    arguments = {"text": arguments}
-            
-            result = await self.execute_tool(tool_name, arguments)
-            results.append({
-                "tool_call_id": tool_call.get('id'),
-                "tool_name": tool_name,
-                "result": result
-            })
+        memory_items = await self.memory_store.get_relevant_memories(
+            session_id=self.session_id,
+            query=query,
+            limit=limit
+        )
         
-        return results
+        return [
+            {
+                "id": item.id,
+                "content": item.content,
+                "importance": item.importance,
+                "created_at": item.created_at.isoformat(),
+                "memory_type": item.memory_type
+            }
+            for item in memory_items
+        ]
+    
+    async def use_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
+        """
+        Use a tool.
+        
+        Args:
+            tool_name: Name of the tool to use
+            **kwargs: Tool parameters
+            
+        Returns:
+            Dict[str, Any]: Tool result
+            
+        Raises:
+            ValueError: If tool not found
+        """
+        # Find the tool
+        tool = next((t for t in self.tools if t.name == tool_name), None)
+        
+        if not tool:
+            raise ValueError(f"Tool not found: {tool_name}")
+        
+        # Use the tool
+        result = await tool.run(**kwargs)
+        
+        # Log tool usage
+        logger.info(f"Agent used tool: {tool_name}")
+        
+        return result
+    
+    def get_available_tools(self) -> List[Dict[str, Any]]:
+        """
+        Get available tools.
+        
+        Returns:
+            List[Dict[str, Any]]: Available tools
+        """
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters
+            }
+            for tool in self.tools
+        ]
+    
+    def get_conversation_history(self) -> List[Dict[str, Any]]:
+        """
+        Get conversation history.
+        
+        Returns:
+            List[Dict[str, Any]]: Conversation history
+        """
+        return self.conversation_history
+    
+    def clear_conversation_history(self) -> None:
+        """Clear conversation history."""
+        self.conversation_history = []
+        self.last_response = None

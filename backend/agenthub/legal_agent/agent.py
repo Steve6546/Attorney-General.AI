@@ -1,158 +1,206 @@
 """
 Attorney-General.AI - Legal Agent
 
-This module implements the specialized Legal Agent for handling legal queries and tasks.
-It inherits from the BaseAgent class and adds legal-specific functionality.
+This module implements the specialized legal agent for the Attorney-General.AI backend.
+It extends the base agent with legal-specific functionality.
 """
 
-import json
 import logging
-from typing import Dict, Any, List, Optional
-import asyncio
+from typing import Dict, Any, List, Optional, Union
+import json
+from datetime import datetime
 
 from backend.agenthub.base_agent import BaseAgent
+from backend.core.llm_service import LLMService
+from backend.memory.memory_store import MemoryStore
+from backend.tools.base_tool import BaseTool
 from backend.utils.prompt_loader import load_prompt
 
 logger = logging.getLogger(__name__)
 
 class LegalAgent(BaseAgent):
-    """Agent specialized in legal assistance and information."""
+    """Legal agent specialized for legal assistance."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        session_id: str,
+        llm_service: Optional[LLMService] = None,
+        memory_store: Optional[MemoryStore] = None,
+        tools: Optional[List[BaseTool]] = None,
+        config: Optional[Dict[str, Any]] = None
+    ):
         """
         Initialize the legal agent.
         
         Args:
-            config: Optional configuration dictionary
+            session_id: Session ID for the agent
+            llm_service: Optional LLM service
+            memory_store: Optional memory store
+            tools: Optional list of tools
+            config: Optional configuration
         """
-        super().__init__(config)
-        self.agent_type = "legal_agent"
-        self.capabilities = [
-            "legal_research",
-            "document_analysis",
-            "legal_advice",
-            "document_generation"
-        ]
-        
         # Load legal agent system prompt
-        self.system_prompt = load_prompt("legal_agent_prompt")
+        system_prompt = load_prompt("legal_agent_prompt.yaml")
         
-        # Register tools (to be implemented)
-        # self.register_tool("legal_research", LegalResearchTool())
-        # self.register_tool("document_analysis", DocumentAnalysisTool())
-        # self.register_tool("legislation_search", LegislationSearchTool())
-        # self.register_tool("code_interpreter", CodeInterpreterTool())
-    
-    async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process a legal request and return a response.
-        
-        Args:
-            request: The request dictionary containing the query and session_id
-            
-        Returns:
-            Dict[str, Any]: The response dictionary
-        """
-        query = request.get("query", "")
-        session_id = request.get("session_id", "")
-        
-        if not query:
-            return {
-                "status": "error",
-                "data": "No query provided"
-            }
-        
-        try:
-            # Check if we should use tools or direct response
-            if self.tools:
-                # Use tool-enabled response generation
-                response = await self._process_with_tools(query, session_id)
-            else:
-                # Use direct response generation
-                response = await self._process_direct(query, session_id)
-            
-            return {
-                "status": "success",
-                "data": response
-            }
-        except Exception as e:
-            logger.error(f"Error processing legal request: {str(e)}")
-            return {
-                "status": "error",
-                "data": f"I apologize, but I encountered an error while processing your request: {str(e)}"
-            }
-    
-    async def _process_direct(self, query: str, session_id: str) -> str:
-        """
-        Process a query directly with the LLM without using tools.
-        
-        Args:
-            query: The user query
-            session_id: The session ID
-            
-        Returns:
-            str: The generated response
-        """
-        # Format the prompt with the query
-        formatted_system_prompt = self.system_prompt.format(
-            capabilities=", ".join(self.capabilities)
+        super().__init__(
+            session_id=session_id,
+            llm_service=llm_service,
+            memory_store=memory_store,
+            tools=tools,
+            system_prompt=system_prompt,
+            config=config
         )
         
-        # Generate response
-        response = await self.generate_response(
-            prompt=query,
-            system_message=formatted_system_prompt
+        # Legal agent specific state
+        self.legal_context = {}
+        self.jurisdiction = config.get("jurisdiction") if config else None
+        self.legal_specialization = config.get("specialization") if config else "general"
+    
+    async def _generate_response(self, message: str) -> str:
+        """
+        Generate a response to a user message with legal context.
+        
+        Args:
+            message: User message
+            
+        Returns:
+            str: Generated response
+        """
+        # Get relevant memories
+        relevant_memories = await self.get_relevant_memories(message)
+        memory_text = ""
+        
+        if relevant_memories:
+            memory_text = "Relevant context from previous conversation:\n"
+            for memory in relevant_memories:
+                memory_text += f"- {memory['content']}\n"
+            memory_text += "\n"
+        
+        # Get legal context if available
+        legal_context = ""
+        if self.legal_context:
+            legal_context = "Legal context:\n"
+            for key, value in self.legal_context.items():
+                legal_context += f"- {key}: {value}\n"
+            legal_context += "\n"
+        
+        # Build prompt with legal focus
+        prompt = f"""
+        {memory_text}
+        {legal_context}
+        
+        User query: {message}
+        
+        Provide a legally sound response based on the query and available context. 
+        If legal research is needed, indicate what information would need to be researched.
+        If specific legal documents need to be analyzed, indicate what documents would be helpful.
+        """
+        
+        # Use legal-specific parameters
+        response = await self.llm_service.generate_response_async(
+            prompt=prompt,
+            max_tokens=1500,  # Longer responses for legal context
+            temperature=0.3,  # Lower temperature for more factual responses
+            system_message=self.system_prompt
         )
         
         return response
     
-    async def _process_with_tools(self, query: str, session_id: str) -> str:
+    async def set_jurisdiction(self, jurisdiction: str) -> None:
         """
-        Process a query using tools when appropriate.
+        Set the jurisdiction for legal context.
         
         Args:
-            query: The user query
-            session_id: The session ID
+            jurisdiction: Jurisdiction code or name
+        """
+        self.jurisdiction = jurisdiction
+        self.legal_context["jurisdiction"] = jurisdiction
+        
+        logger.info(f"Legal agent jurisdiction set to: {jurisdiction}")
+    
+    async def set_legal_specialization(self, specialization: str) -> None:
+        """
+        Set the legal specialization.
+        
+        Args:
+            specialization: Legal specialization area
+        """
+        self.legal_specialization = specialization
+        self.legal_context["specialization"] = specialization
+        
+        logger.info(f"Legal agent specialization set to: {specialization}")
+    
+    async def add_legal_context(self, key: str, value: str) -> None:
+        """
+        Add legal context information.
+        
+        Args:
+            key: Context key
+            value: Context value
+        """
+        self.legal_context[key] = value
+        
+        logger.info(f"Added legal context: {key}")
+    
+    async def perform_legal_research(self, query: str, jurisdiction: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Perform legal research using available tools.
+        
+        Args:
+            query: Research query
+            jurisdiction: Optional jurisdiction override
             
         Returns:
-            str: The final response after potential tool usage
+            Dict[str, Any]: Research results
+            
+        Raises:
+            ValueError: If legal research tool not available
         """
-        # Format the prompt with the query and tool descriptions
-        formatted_system_prompt = self.system_prompt.format(
-            capabilities=", ".join(self.capabilities),
-            tool_descriptions=json.dumps(self.get_tool_descriptions(), indent=2)
+        # Use jurisdiction from agent state if not provided
+        jurisdiction = jurisdiction or self.jurisdiction
+        
+        # Find legal research tool
+        legal_research_tool = next((t for t in self.tools if t.name == "legal_research"), None)
+        
+        if not legal_research_tool:
+            raise ValueError("Legal research tool not available")
+        
+        # Use the tool
+        result = await legal_research_tool.run(
+            query=query,
+            jurisdiction=jurisdiction
         )
         
-        # Generate response with potential tool calls
-        response = await self.generate_with_tools(
-            prompt=query,
-            system_message=formatted_system_prompt
+        # Add research to legal context
+        self.legal_context["recent_research"] = f"Research on '{query}' in {jurisdiction}"
+        
+        return result
+    
+    async def analyze_legal_document(self, document_id: str) -> Dict[str, Any]:
+        """
+        Analyze a legal document using available tools.
+        
+        Args:
+            document_id: Document ID
+            
+        Returns:
+            Dict[str, Any]: Analysis results
+            
+        Raises:
+            ValueError: If document analysis tool not available
+        """
+        # Find document analysis tool
+        document_analysis_tool = next((t for t in self.tools if t.name == "document_analysis"), None)
+        
+        if not document_analysis_tool:
+            raise ValueError("Document analysis tool not available")
+        
+        # Use the tool
+        result = await document_analysis_tool.run(
+            document_id=document_id
         )
         
-        # Check if the LLM wants to use tools
-        if response.get("has_tool_calls", False):
-            # Execute the tool calls
-            tool_results = await self.handle_tool_calls(response.get("tool_calls", []))
-            
-            # Format tool results for the LLM
-            tool_results_str = json.dumps(tool_results, indent=2)
-            
-            # Generate final response incorporating tool results
-            final_prompt = f"""
-            Based on the original query: "{query}"
-            
-            I executed the following tools:
-            {tool_results_str}
-            
-            Please provide a final response to the user's query incorporating these tool results.
-            """
-            
-            final_response = await self.generate_response(
-                prompt=final_prompt,
-                system_message=formatted_system_prompt
-            )
-            
-            return final_response
-        else:
-            # Return the direct response if no tools were called
-            return response.get("content", "I apologize, but I couldn't generate a proper response.")
+        # Add analysis to legal context
+        self.legal_context["recent_document"] = f"Analysis of document {document_id}"
+        
+        return result

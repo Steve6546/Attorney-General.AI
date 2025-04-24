@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./data:/data
+    environment:
+      - DATABASE_URL=sqlite:////data/attorney_general.db
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LEGAL_API_KEY=${LEGAL_API_KEY}
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+    networks:
+      - attorney-general-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - REACT_APP_API_URL=http://backend:8000
+      - NODE_ENV=development
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - attorney-general-network
+
+  # Optional PostgreSQL database (uncomment to use instead of SQLite)
+  # db:
+  #   image: postgres:14
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   environment:
+  #     - POSTGRES_USER=postgres
+  #     - POSTGRES_PASSWORD=postgres
+  #     - POSTGRES_DB=attorney_general
+  #   restart: unless-stopped
+  #   networks:
+  #     - attorney-general-network
+
+networks:
+  attorney-general-network:
+    driver: bridge
+
+volumes:
+  data:
+  # postgres_data:  # Uncomment if using PostgreSQL

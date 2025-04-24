@@ -1,16 +1,205 @@
-fastapi>=0.68.0
-uvicorn>=0.15.0
-pydantic>=1.8.2
-sqlalchemy>=1.4.23
-python-jose>=3.3.0
-passlib>=1.7.4
-python-multipart>=0.0.5
-aiohttp>=3.8.1
-langchain>=0.0.139
-openai>=0.27.0
-tiktoken>=0.3.0
-pytest>=7.0.0
-black>=22.1.0
-isort>=5.10.1
-mypy>=0.931
-pytest-cov>=3.0.0
+# Attorney-General.AI Requirements
+
+## Python Dependencies
+```
+# Core Dependencies
+fastapi==0.104.1
+uvicorn==0.23.2
+pydantic==2.4.2
+sqlalchemy==2.0.22
+alembic==1.12.0
+python-dotenv==1.0.0
+python-multipart==0.0.6
+
+# Security
+pyjwt==2.8.0
+passlib==1.7.4
+bcrypt==4.0.1
+cryptography==41.0.4
+python-jose==3.3.0
+
+# LLM Integration
+openai==1.2.0
+langchain==0.0.335
+langchain-openai==0.0.2
+tiktoken==0.5.1
+chromadb==0.4.18
+sentence-transformers==2.2.2
+
+# Document Processing
+pypdf==3.17.0
+docx2txt==0.8
+python-pptx==0.6.21
+pytesseract==0.3.10
+pdf2image==1.16.3
+
+# Web and API
+httpx==0.25.0
+requests==2.31.0
+aiohttp==3.8.6
+websockets==11.0.3
+starlette==0.27.0
+itsdangerous==2.1.2
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.25.0
+
+# Utilities
+pyyaml==6.0.1
+jinja2==3.1.2
+python-slugify==8.0.1
+tenacity==8.2.3
+tqdm==4.66.1
+```
+
+## JavaScript Dependencies
+```json
+{
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.18.0",
+    "axios": "^1.6.0",
+    "socket.io-client": "^4.7.2",
+    "zustand": "^4.4.6",
+    "tailwindcss": "^3.3.5",
+    "daisyui": "^3.9.4",
+    "react-markdown": "^9.0.0",
+    "react-syntax-highlighter": "^15.5.0",
+    "react-icons": "^4.11.0",
+    "date-fns": "^2.30.0",
+    "uuid": "^9.0.1",
+    "lodash": "^4.17.21",
+    "react-dropzone": "^14.2.3",
+    "react-pdf": "^7.5.1",
+    "chart.js": "^4.4.0",
+    "react-chartjs-2": "^5.2.0"
+  },
+  "devDependencies": {
+    "vite": "^4.5.0",
+    "@vitejs/plugin-react": "^4.1.1",
+    "eslint": "^8.53.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "prettier": "^3.0.3",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.31",
+    "typescript": "^5.2.2",
+    "@types/react": "^18.2.37",
+    "@types/react-dom": "^18.2.15",
+    "@types/node": "^20.9.0",
+    "vitest": "^0.34.6",
+    "@testing-library/react": "^14.0.0",
+    "@testing-library/jest-dom": "^6.1.4"
+  }
+}
+```
+
+## System Requirements
+- Python 3.10+
+- Node.js 18+
+- PostgreSQL 14+
+- Redis 6+
+- Docker 24+ (for containerization)
+- 4GB+ RAM
+- 10GB+ disk space
+
+## Environment Variables
+```
+# Core Settings
+DEBUG=False
+SECRET_KEY=your-secret-key
+ENVIRONMENT=production
+
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/attorney_general
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Security
+JWT_SECRET=your-jwt-secret
+JWT_EXPIRATION_MINUTES=60
+ENCRYPTION_KEY=your-encryption-key
+CSRF_SECRET=your-csrf-secret
+IP_ALLOWLIST=
+IP_BLOCKLIST=
+
+# LLM
+OPENAI_API_KEY=your-openai-api-key
+DEFAULT_MODEL=gpt-4
+MODEL_TEMPERATURE=0.7
+MAX_TOKENS=1000
+
+# Storage
+STORAGE_TYPE=local
+STORAGE_PATH=/path/to/storage
+# For S3
+# STORAGE_TYPE=s3
+# AWS_ACCESS_KEY_ID=your-aws-access-key
+# AWS_SECRET_ACCESS_KEY=your-aws-secret-key
+# AWS_REGION=us-west-2
+# S3_BUCKET_NAME=your-bucket-name
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FILE=/path/to/logs/attorney-general.log
+```
+
+## Installation Instructions
+1. Clone the repository
+   ```bash
+   git clone https://github.com/Steve6546/Attorney-General.AI.git
+   cd Attorney-General.AI
+   ```
+
+2. Set up Python environment
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+3. Set up environment variables
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
+
+4. Set up the database
+   ```bash
+   alembic upgrade head
+   ```
+
+5. Set up frontend
+   ```bash
+   cd frontend
+   npm install
+   ```
+
+6. Run the application
+   ```bash
+   # Backend (from project root)
+   uvicorn backend.main:app --reload
+
+   # Frontend (from frontend directory)
+   npm run dev
+   ```
+
+7. For Docker deployment
+   ```bash
+   docker-compose up -d
+   ```
+
+## Testing
+```bash
+# Backend tests
+pytest
+
+# Frontend tests
+cd frontend
+npm test
+```

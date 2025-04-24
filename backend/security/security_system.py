@@ -1,167 +1,577 @@
 """
-Attorney-General.AI - Security System
+Security System for Attorney-General.AI.
 
-This module implements the security system for the Attorney-General.AI backend.
-It provides functionality for authentication, authorization, and request validation.
+This module provides comprehensive security features including authentication, authorization,
+encryption, and audit logging.
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Callable
-import jwt
-import time
-from datetime import datetime, timedelta
+import os
+import json
 import hashlib
 import secrets
+import time
+import jwt
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List, Tuple
+import re
+import ipaddress
+from sqlalchemy.orm import Session
 
 from backend.config.settings import settings
+from backend.data.models import User, AuditLog, SecurityEvent
 
+# Configure logging
 logger = logging.getLogger(__name__)
 
 class SecuritySystem:
-    """Security system for authentication, authorization, and validation."""
+    """Comprehensive security system for the application."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, db: Session):
         """
         Initialize the security system.
         
         Args:
-            config: Optional configuration dictionary
+            db: Database session
         """
-        self.config = config or {}
-        self.secret_key = settings.SECRET_KEY
-        self.token_expire_minutes = settings.ACCESS_TOKEN_EXPIRE_MINUTES
-        self.allowed_origins = [settings.FRONTEND_URL]
+        self.db = db
+        self.jwt_secret = settings.JWT_SECRET or secrets.token_hex(32)
+        self.jwt_algorithm = "HS256"
+        self.jwt_expiration = settings.JWT_EXPIRATION_MINUTES or 60
+        
+        # Password policy
+        self.password_min_length = 10
+        self.password_require_uppercase = True
+        self.password_require_lowercase = True
+        self.password_require_digit = True
+        self.password_require_special = True
+        
+        # Rate limiting
+        self.rate_limit_attempts = 5
+        self.rate_limit_window = 300  # 5 minutes
+        self.rate_limit_cache = {}  # IP -> [timestamps]
+        
+        # IP allowlist/blocklist
+        self.ip_allowlist = self._parse_ip_list(settings.IP_ALLOWLIST or "")
+        self.ip_blocklist = self._parse_ip_list(settings.IP_BLOCKLIST or "")
+        
+        logger.info("Security System initialized")
     
-    async def create_access_token(self, data: Dict[str, Any]) -> str:
+    def authenticate_user(self, username: str, password: str, ip_address: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """
-        Create an access token.
+        Authenticate a user.
         
         Args:
-            data: The data to encode in the token
+            username: Username
+            password: Password
+            ip_address: Client IP address
             
         Returns:
-            str: The encoded JWT token
+            Tuple[bool, Optional[Dict[str, Any]]]: (success, user_data)
         """
-        to_encode = data.copy()
-        expire = datetime.utcnow() + timedelta(minutes=self.token_expire_minutes)
-        to_encode.update({"exp": expire})
-        
-        encoded_jwt = jwt.encode(to_encode, self.secret_key, algorithm="HS256")
-        return encoded_jwt
+        try:
+            # Check IP restrictions
+            if not self._check_ip_access(ip_address):
+                self._log_security_event(
+                    "authentication_failure",
+                    f"IP address blocked: {ip_address}",
+                    username=username,
+                    ip_address=ip_address
+                )
+                return False, None
+            
+            # Check rate limiting
+            if self._is_rate_limited(ip_address):
+                self._log_security_event(
+                    "authentication_failure",
+                    f"Rate limited: {ip_address}",
+                    username=username,
+                    ip_address=ip_address
+                )
+                return False, None
+            
+            # Get user from database
+            user = self.db.query(User).filter(User.username == username).first()
+            
+            if not user:
+                self._log_security_event(
+                    "authentication_failure",
+                    f"User not found: {username}",
+                    username=username,
+                    ip_address=ip_address
+                )
+                self._update_rate_limit(ip_address)
+                return False, None
+            
+            # Check if account is locked
+            if user.is_locked:
+                self._log_security_event(
+                    "authentication_failure",
+                    f"Account locked: {username}",
+                    username=username,
+                    ip_address=ip_address,
+                    user_id=user.id
+                )
+                return False, None
+            
+            # Verify password
+            if not self._verify_password(password, user.password_hash, user.password_salt):
+                # Increment failed attempts
+                user.failed_login_attempts += 1
+                
+                # Lock account if too many failed attempts
+                if user.failed_login_attempts >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
+                    user.is_locked = True
+                    self._log_security_event(
+                        "account_locked",
+                        f"Account locked after {user.failed_login_attempts} failed attempts",
+                        username=username,
+                        ip_address=ip_address,
+                        user_id=user.id
+                    )
+                
+                self.db.commit()
+                
+                self._log_security_event(
+                    "authentication_failure",
+                    f"Invalid password for user: {username}",
+                    username=username,
+                    ip_address=ip_address,
+                    user_id=user.id
+                )
+                
+                self._update_rate_limit(ip_address)
+                return False, None
+            
+            # Authentication successful
+            
+            # Reset failed attempts
+            user.failed_login_attempts = 0
+            user.last_login_at = datetime.utcnow()
+            user.last_login_ip = ip_address
+            self.db.commit()
+            
+            # Generate token
+            token = self.generate_jwt_token(user)
+            
+            self._log_security_event(
+                "authentication_success",
+                f"User authenticated: {username}",
+                username=username,
+                ip_address=ip_address,
+                user_id=user.id
+            )
+            
+            # Return user data
+            return True, {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.role,
+                "token": token
+            }
+        except Exception as e:
+            logger.error(f"Authentication error: {str(e)}")
+            self._log_security_event(
+                "authentication_error",
+                f"Error during authentication: {str(e)}",
+                username=username,
+                ip_address=ip_address
+            )
+            return False, None
     
-    async def verify_token(self, token: str) -> Optional[Dict[str, Any]]:
+    def register_user(self, username: str, email: str, password: str, role: str = "user") -> Tuple[bool, Optional[str]]:
+        """
+        Register a new user.
+        
+        Args:
+            username: Username
+            email: Email address
+            password: Password
+            role: User role
+            
+        Returns:
+            Tuple[bool, Optional[str]]: (success, error_message)
+        """
+        try:
+            # Check if username already exists
+            existing_user = self.db.query(User).filter(User.username == username).first()
+            if existing_user:
+                return False, "Username already exists"
+            
+            # Check if email already exists
+            existing_email = self.db.query(User).filter(User.email == email).first()
+            if existing_email:
+                return False, "Email already exists"
+            
+            # Validate password
+            password_validation = self._validate_password(password)
+            if not password_validation[0]:
+                return False, password_validation[1]
+            
+            # Generate password hash and salt
+            salt = secrets.token_hex(16)
+            password_hash = self._hash_password(password, salt)
+            
+            # Create user
+            new_user = User(
+                username=username,
+                email=email,
+                password_hash=password_hash,
+                password_salt=salt,
+                role=role,
+                created_at=datetime.utcnow()
+            )
+            
+            self.db.add(new_user)
+            self.db.commit()
+            
+            self._log_security_event(
+                "user_registered",
+                f"New user registered: {username}",
+                username=username,
+                user_id=new_user.id
+            )
+            
+            return True, None
+        except Exception as e:
+            logger.error(f"User registration error: {str(e)}")
+            self.db.rollback()
+            return False, f"Registration error: {str(e)}"
+    
+    def generate_jwt_token(self, user: User) -> str:
+        """
+        Generate a JWT token for a user.
+        
+        Args:
+            user: User object
+            
+        Returns:
+            str: JWT token
+        """
+        expiration = datetime.utcnow() + timedelta(minutes=self.jwt_expiration)
+        
+        payload = {
+            "sub": user.id,
+            "username": user.username,
+            "role": user.role,
+            "exp": expiration.timestamp()
+        }
+        
+        token = jwt.encode(payload, self.jwt_secret, algorithm=self.jwt_algorithm)
+        
+        return token
+    
+    def verify_jwt_token(self, token: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """
         Verify a JWT token.
         
         Args:
-            token: The JWT token to verify
+            token: JWT token
             
         Returns:
-            Optional[Dict[str, Any]]: The decoded token payload or None if invalid
+            Tuple[bool, Optional[Dict[str, Any]]]: (is_valid, payload)
         """
         try:
-            payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
-            return payload
-        except jwt.PyJWTError:
-            return None
+            payload = jwt.decode(token, self.jwt_secret, algorithms=[self.jwt_algorithm])
+            
+            # Check if token is expired
+            if "exp" in payload and datetime.utcnow().timestamp() > payload["exp"]:
+                return False, None
+            
+            return True, payload
+        except jwt.PyJWTError as e:
+            logger.warning(f"JWT verification failed: {str(e)}")
+            return False, None
     
-    async def hash_password(self, password: str) -> str:
+    def check_permission(self, user_id: str, resource: str, action: str) -> bool:
         """
-        Hash a password.
+        Check if a user has permission to perform an action on a resource.
         
         Args:
-            password: The password to hash
+            user_id: User ID
+            resource: Resource name
+            action: Action name
             
         Returns:
-            str: The hashed password
+            bool: True if user has permission, False otherwise
         """
-        salt = secrets.token_hex(16)
-        pwdhash = hashlib.pbkdf2_hmac(
-            'sha256', 
-            password.encode('utf-8'), 
-            salt.encode('utf-8'), 
-            100000
+        try:
+            # Get user
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if not user:
+                return False
+            
+            # Admin has all permissions
+            if user.role == "admin":
+                return True
+            
+            # Check role-based permissions
+            if user.role == "legal_professional" and resource in ["documents", "cases", "research"]:
+                return True
+            
+            if user.role == "user" and resource in ["documents", "research"]:
+                if action in ["read", "create"]:
+                    return True
+            
+            # Default deny
+            return False
+        except Exception as e:
+            logger.error(f"Permission check error: {str(e)}")
+            return False
+    
+    def _hash_password(self, password: str, salt: str) -> str:
+        """
+        Hash a password with a salt.
+        
+        Args:
+            password: Password
+            salt: Salt
+            
+        Returns:
+            str: Hashed password
+        """
+        # Use PBKDF2 with SHA-256
+        key = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            100000  # 100,000 iterations
         ).hex()
         
-        return f"{salt}${pwdhash}"
+        return key
     
-    async def verify_password(self, plain_password: str, hashed_password: str) -> bool:
+    def _verify_password(self, password: str, stored_hash: str, salt: str) -> bool:
         """
-        Verify a password against a hash.
+        Verify a password against a stored hash.
         
         Args:
-            plain_password: The plain text password
-            hashed_password: The hashed password
+            password: Password to verify
+            stored_hash: Stored password hash
+            salt: Salt
             
         Returns:
-            bool: True if the password matches, False otherwise
+            bool: True if password is correct, False otherwise
         """
-        salt, stored_hash = hashed_password.split('$')
-        pwdhash = hashlib.pbkdf2_hmac(
-            'sha256', 
-            plain_password.encode('utf-8'), 
-            salt.encode('utf-8'), 
-            100000
-        ).hex()
-        
-        return pwdhash == stored_hash
+        calculated_hash = self._hash_password(password, salt)
+        return secrets.compare_digest(calculated_hash, stored_hash)
     
-    async def validate_request(self, request_data: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_password(self, password: str) -> Tuple[bool, Optional[str]]:
         """
-        Validate a request against a schema.
+        Validate a password against the password policy.
         
         Args:
-            request_data: The request data to validate
-            schema: The schema to validate against
+            password: Password to validate
             
         Returns:
-            Dict[str, Any]: Validation result with 'valid' and 'errors' keys
+            Tuple[bool, Optional[str]]: (is_valid, error_message)
         """
-        errors = []
+        # Check length
+        if len(password) < self.password_min_length:
+            return False, f"Password must be at least {self.password_min_length} characters long"
         
-        # Check required fields
-        if "required" in schema:
-            for field in schema["required"]:
-                if field not in request_data:
-                    errors.append(f"Missing required field: {field}")
+        # Check for uppercase letter
+        if self.password_require_uppercase and not any(c.isupper() for c in password):
+            return False, "Password must contain at least one uppercase letter"
         
-        # Check field types
-        if "properties" in schema:
-            for field, field_schema in schema["properties"].items():
-                if field in request_data:
-                    field_type = field_schema.get("type")
-                    
-                    # Check type
-                    if field_type == "string" and not isinstance(request_data[field], str):
-                        errors.append(f"Field '{field}' must be a string")
-                    elif field_type == "integer" and not isinstance(request_data[field], int):
-                        errors.append(f"Field '{field}' must be an integer")
-                    elif field_type == "number" and not isinstance(request_data[field], (int, float)):
-                        errors.append(f"Field '{field}' must be a number")
-                    elif field_type == "boolean" and not isinstance(request_data[field], bool):
-                        errors.append(f"Field '{field}' must be a boolean")
-                    elif field_type == "array" and not isinstance(request_data[field], list):
-                        errors.append(f"Field '{field}' must be an array")
-                    elif field_type == "object" and not isinstance(request_data[field], dict):
-                        errors.append(f"Field '{field}' must be an object")
+        # Check for lowercase letter
+        if self.password_require_lowercase and not any(c.islower() for c in password):
+            return False, "Password must contain at least one lowercase letter"
         
-        return {
-            "valid": len(errors) == 0,
-            "errors": errors
-        }
+        # Check for digit
+        if self.password_require_digit and not any(c.isdigit() for c in password):
+            return False, "Password must contain at least one digit"
+        
+        # Check for special character
+        if self.password_require_special and not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            return False, "Password must contain at least one special character"
+        
+        return True, None
     
-    def is_origin_allowed(self, origin: str) -> bool:
+    def _is_rate_limited(self, ip_address: str) -> bool:
         """
-        Check if an origin is allowed for CORS.
+        Check if an IP address is rate limited.
         
         Args:
-            origin: The origin to check
+            ip_address: IP address
             
         Returns:
-            bool: True if the origin is allowed, False otherwise
+            bool: True if rate limited, False otherwise
         """
-        # Allow all origins in development mode
-        if settings.LOG_LEVEL == "DEBUG":
-            return True
+        if ip_address not in self.rate_limit_cache:
+            return False
         
-        return origin in self.allowed_origins
+        # Get timestamps within the window
+        current_time = time.time()
+        window_start = current_time - self.rate_limit_window
+        
+        recent_attempts = [t for t in self.rate_limit_cache[ip_address] if t > window_start]
+        self.rate_limit_cache[ip_address] = recent_attempts
+        
+        return len(recent_attempts) >= self.rate_limit_attempts
+    
+    def _update_rate_limit(self, ip_address: str) -> None:
+        """
+        Update rate limit for an IP address.
+        
+        Args:
+            ip_address: IP address
+        """
+        current_time = time.time()
+        
+        if ip_address not in self.rate_limit_cache:
+            self.rate_limit_cache[ip_address] = []
+        
+        self.rate_limit_cache[ip_address].append(current_time)
+    
+    def _parse_ip_list(self, ip_list_str: str) -> List[Any]:
+        """
+        Parse a comma-separated list of IP addresses or CIDR ranges.
+        
+        Args:
+            ip_list_str: Comma-separated list of IPs or CIDR ranges
+            
+        Returns:
+            List[Any]: List of IP address objects
+        """
+        if not ip_list_str:
+            return []
+        
+        ip_objects = []
+        
+        for ip_str in ip_list_str.split(","):
+            ip_str = ip_str.strip()
+            if not ip_str:
+                continue
+            
+            try:
+                # Check if it's a CIDR range
+                if "/" in ip_str:
+                    ip_objects.append(ipaddress.ip_network(ip_str, strict=False))
+                else:
+                    ip_objects.append(ipaddress.ip_address(ip_str))
+            except ValueError:
+                logger.warning(f"Invalid IP address or CIDR range: {ip_str}")
+        
+        return ip_objects
+    
+    def _check_ip_access(self, ip_address: str) -> bool:
+        """
+        Check if an IP address is allowed to access the system.
+        
+        Args:
+            ip_address: IP address
+            
+        Returns:
+            bool: True if allowed, False if blocked
+        """
+        try:
+            ip = ipaddress.ip_address(ip_address)
+            
+            # Check blocklist first
+            for blocked_ip in self.ip_blocklist:
+                if isinstance(blocked_ip, ipaddress.IPv4Network) or isinstance(blocked_ip, ipaddress.IPv6Network):
+                    if ip in blocked_ip:
+                        return False
+                elif ip == blocked_ip:
+                    return False
+            
+            # If allowlist is empty, allow all non-blocked IPs
+            if not self.ip_allowlist:
+                return True
+            
+            # If allowlist is not empty, only allow IPs in the allowlist
+            for allowed_ip in self.ip_allowlist:
+                if isinstance(allowed_ip, ipaddress.IPv4Network) or isinstance(allowed_ip, ipaddress.IPv6Network):
+                    if ip in allowed_ip:
+                        return True
+                elif ip == allowed_ip:
+                    return True
+            
+            # IP is not in allowlist
+            return False
+        except ValueError:
+            logger.warning(f"Invalid IP address: {ip_address}")
+            return False
+    
+    def _log_security_event(self, event_type: str, description: str, **metadata) -> None:
+        """
+        Log a security event.
+        
+        Args:
+            event_type: Type of event
+            description: Event description
+            **metadata: Additional metadata
+        """
+        try:
+            # Create security event
+            event = SecurityEvent(
+                event_type=event_type,
+                description=description,
+                metadata=json.dumps(metadata),
+                created_at=datetime.utcnow()
+            )
+            
+            self.db.add(event)
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Error logging security event: {str(e)}")
+            self.db.rollback()
+    
+    def log_audit(self, user_id: Optional[str], action: str, resource_type: str, resource_id: Optional[str], details: str) -> None:
+        """
+        Log an audit event.
+        
+        Args:
+            user_id: User ID (optional)
+            action: Action performed
+            resource_type: Type of resource
+            resource_id: Resource ID (optional)
+            details: Additional details
+        """
+        try:
+            # Create audit log
+            audit_log = AuditLog(
+                user_id=user_id,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                details=details,
+                created_at=datetime.utcnow()
+            )
+            
+            self.db.add(audit_log)
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Error logging audit event: {str(e)}")
+            self.db.rollback()
+    
+    def encrypt_data(self, data: str) -> str:
+        """
+        Encrypt sensitive data.
+        
+        Args:
+            data: Data to encrypt
+            
+        Returns:
+            str: Encrypted data
+        """
+        # In a real implementation, this would use a proper encryption library
+        # For demonstration purposes, we'll use a simple base64 encoding
+        import base64
+        return base64.b64encode(data.encode("utf-8")).decode("utf-8")
+    
+    def decrypt_data(self, encrypted_data: str) -> str:
+        """
+        Decrypt sensitive data.
+        
+        Args:
+            encrypted_data: Encrypted data
+            
+        Returns:
+            str: Decrypted data
+        """
+        # In a real implementation, this would use a proper encryption library
+        # For demonstration purposes, we'll use a simple base64 decoding
+        import base64
+        return base64.b64decode(encrypted_data.encode("utf-8")).decode("utf-8")

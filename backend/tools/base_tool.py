@@ -1,76 +1,119 @@
 """
 Attorney-General.AI - Base Tool
 
-This module defines the base tool class that all specialized tools inherit from.
-It provides common functionality and interfaces for all tools.
+This module defines the base tool class for the Attorney-General.AI backend.
+It provides the foundation for specialized tools like legal research and document analysis.
 """
 
-from typing import Dict, Any, Optional
 import logging
+from typing import Dict, Any, List, Optional, Union
+import uuid
 import json
+from datetime import datetime
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class BaseTool:
-    """Base class for all tools in the system."""
+    """Base tool class for Attorney-General.AI."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        parameters: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None
+    ):
         """
         Initialize the base tool.
         
         Args:
-            config: Optional configuration dictionary
+            name: Tool name
+            description: Tool description
+            parameters: Tool parameters schema
+            config: Optional configuration
         """
+        self.name = name
+        self.description = description
+        self.parameters = parameters
         self.config = config or {}
-        self.name = "base_tool"
-        self.description = "Base tool class that should be extended."
-        self.parameters = {}
-        self.required_parameters = []
+        
+        # Initialize tool state
+        self.usage_count = 0
+        self.last_used = None
+        self.metadata = {}
     
-    async def execute(self, params: Dict[str, Any]) -> Any:
+    async def run(self, **kwargs) -> Dict[str, Any]:
         """
-        Execute the tool with the given parameters.
+        Run the tool with the provided parameters.
         
         Args:
-            params: The parameters to pass to the tool
+            **kwargs: Tool parameters
             
         Returns:
-            Any: The tool execution result
+            Dict[str, Any]: Tool result
+            
+        Raises:
+            NotImplementedError: If not implemented by subclass
         """
-        # This method should be overridden by subclasses
-        raise NotImplementedError("Method not implemented in base class")
+        raise NotImplementedError("Subclasses must implement this method")
     
-    def get_description(self) -> Dict[str, Any]:
+    def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
         """
-        Get the tool description for LLM function calling.
+        Validate tool parameters.
+        
+        Args:
+            parameters: Parameters to validate
+            
+        Returns:
+            bool: True if parameters are valid
+            
+        Raises:
+            ValueError: If parameters are invalid
+        """
+        # Basic validation - check if required parameters are present
+        for param_name, param_spec in self.parameters.items():
+            if param_spec.get("required", False) and param_name not in parameters:
+                raise ValueError(f"Missing required parameter: {param_name}")
+        
+        return True
+    
+    def update_usage_stats(self) -> None:
+        """Update tool usage statistics."""
+        self.usage_count += 1
+        self.last_used = datetime.utcnow()
+    
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """
+        Get tool usage statistics.
         
         Returns:
-            Dict[str, Any]: The tool description
+            Dict[str, Any]: Usage statistics
         """
         return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": self.parameters,
-                    "required": self.required_parameters
-                }
-            }
+            "name": self.name,
+            "usage_count": self.usage_count,
+            "last_used": self.last_used.isoformat() if self.last_used else None
         }
     
-    def validate_params(self, params: Dict[str, Any]) -> bool:
+    def set_metadata(self, key: str, value: Any) -> None:
         """
-        Validate that all required parameters are present.
+        Set tool metadata.
         
         Args:
-            params: The parameters to validate
+            key: Metadata key
+            value: Metadata value
+        """
+        self.metadata[key] = value
+    
+    def get_metadata(self, key: str) -> Optional[Any]:
+        """
+        Get tool metadata.
+        
+        Args:
+            key: Metadata key
             
         Returns:
-            bool: True if all required parameters are present, False otherwise
+            Optional[Any]: Metadata value
         """
-        for param in self.required_parameters:
-            if param not in params:
-                return False
-        return True
+        return self.metadata.get(key)

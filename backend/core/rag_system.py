@@ -1,315 +1,327 @@
 """
-Attorney-General.AI - RAG System
+RAG (Retrieval-Augmented Generation) System for Attorney-General.AI.
 
-This module implements the Retrieval Augmented Generation (RAG) system for the Attorney-General.AI backend.
-It provides functionality for document processing, embedding, and retrieval.
+This module provides functionality for document indexing, retrieval, and augmented generation.
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Tuple
 import os
 import json
 import numpy as np
-from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+from sqlalchemy.orm import Session
+import uuid
+from datetime import datetime
+import asyncio
 
-from backend.config.settings import settings
 from backend.core.llm_service import LLMService
+from backend.data.models import Document, DocumentChunk
+from backend.data.repository import DocumentRepository, DocumentChunkRepository
+from backend.config.settings import settings
 
+# Configure logging
 logger = logging.getLogger(__name__)
 
 class RAGSystem:
-    """RAG system for document retrieval and generation."""
+    """Retrieval-Augmented Generation System."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, db: Session, llm_service: Optional[LLMService] = None):
         """
         Initialize the RAG system.
         
         Args:
-            config: Optional configuration dictionary
+            db: Database session
+            llm_service: LLM service instance
         """
-        self.config = config or {}
-        self.vector_db_path = self.config.get("vector_db_path", settings.VECTOR_DB_PATH)
-        self.embedding_model = self.config.get("embedding_model", settings.EMBEDDING_MODEL)
-        self.llm_service = LLMService()
+        self.db = db
+        self.llm_service = llm_service or LLMService()
+        self.document_repo = DocumentRepository(db)
+        self.chunk_repo = DocumentChunkRepository(db)
         
-        # Create vector DB directory if it doesn't exist
-        os.makedirs(self.vector_db_path, exist_ok=True)
+        # Chunk size settings
+        self.chunk_size = settings.RAG_CHUNK_SIZE
+        self.chunk_overlap = settings.RAG_CHUNK_OVERLAP
+        
+        logger.info("RAG System initialized")
     
-    async def process_document(self, document_path: str, document_id: str) -> Dict[str, Any]:
+    async def index_document(self, document_id: str) -> Dict[str, Any]:
         """
-        Process a document for RAG.
+        Index a document for retrieval.
         
         Args:
-            document_path: Path to the document file
-            document_id: ID of the document
+            document_id: Document ID
             
         Returns:
-            Dict[str, Any]: Processing result
+            Dict[str, Any]: Indexing result
         """
         try:
-            # Extract text from document (simplified for now)
-            text = await self._extract_text(document_path)
+            # Get document
+            document = self.document_repo.get_by_id(document_id)
+            if not document:
+                return {
+                    "document_id": document_id,
+                    "status": "error",
+                    "message": "Document not found"
+                }
             
-            # Split text into chunks
-            chunks = self._split_text(text)
+            # Check if file exists
+            if not os.path.exists(document.file_path):
+                return {
+                    "document_id": document_id,
+                    "status": "error",
+                    "message": "Document file not found"
+                }
             
-            # Generate embeddings for chunks
-            chunk_embeddings = await self._generate_embeddings(chunks)
+            # Read document content
+            with open(document.file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
             
-            # Store embeddings
-            await self._store_embeddings(document_id, chunks, chunk_embeddings)
+            # Delete existing chunks
+            self.chunk_repo.delete_by_document_id(document_id)
+            
+            # Create chunks
+            chunks = self._create_chunks(content)
+            
+            # Create embeddings for chunks
+            chunk_objects = []
+            for i, chunk in enumerate(chunks):
+                # Generate embedding
+                embedding = await self.llm_service.generate_embeddings_async(chunk)
+                
+                # Create chunk object
+                chunk_object = DocumentChunk(
+                    id=str(uuid.uuid4()),
+                    document_id=document_id,
+                    chunk_index=i,
+                    content=chunk,
+                    embedding=embedding,
+                    created_at=datetime.utcnow()
+                )
+                
+                chunk_objects.append(chunk_object)
+            
+            # Save chunks to database
+            for chunk_object in chunk_objects:
+                self.chunk_repo.create(chunk_object)
+            
+            # Update document processed status
+            self.document_repo.update_processed_status(document_id, True)
             
             return {
                 "document_id": document_id,
-                "chunks_processed": len(chunks),
-                "status": "success"
+                "chunks_created": len(chunk_objects),
+                "status": "success",
+                "message": f"Document indexed successfully with {len(chunk_objects)} chunks"
             }
         except Exception as e:
-            logger.error(f"Error processing document: {str(e)}")
+            logger.error(f"Error indexing document: {str(e)}")
             return {
                 "document_id": document_id,
                 "status": "error",
-                "error": str(e)
+                "message": f"Error indexing document: {str(e)}"
             }
     
-    async def query(self, query: str, top_k: int = 3) -> Dict[str, Any]:
+    def _create_chunks(self, content: str) -> List[str]:
         """
-        Query the RAG system.
+        Create chunks from document content.
         
         Args:
-            query: The query string
-            top_k: Number of top results to return
+            content: Document content
             
         Returns:
-            Dict[str, Any]: Query results
-        """
-        try:
-            # Generate embedding for query
-            query_embedding = await self._generate_query_embedding(query)
-            
-            # Retrieve relevant chunks
-            relevant_chunks = await self._retrieve_chunks(query_embedding, top_k)
-            
-            # Generate response
-            response = await self._generate_response(query, relevant_chunks)
-            
-            return {
-                "query": query,
-                "response": response,
-                "sources": [chunk["metadata"] for chunk in relevant_chunks]
-            }
-        except Exception as e:
-            logger.error(f"Error querying RAG system: {str(e)}")
-            return {
-                "query": query,
-                "status": "error",
-                "error": str(e)
-            }
-    
-    async def _extract_text(self, document_path: str) -> str:
-        """
-        Extract text from a document.
-        
-        Args:
-            document_path: Path to the document file
-            
-        Returns:
-            str: Extracted text
-        """
-        # This is a simplified implementation
-        # In a real system, this would handle different file types (PDF, DOCX, etc.)
-        
-        file_extension = Path(document_path).suffix.lower()
-        
-        if file_extension in [".txt", ".md"]:
-            # Read text file directly
-            with open(document_path, "r", encoding="utf-8") as f:
-                return f.read()
-        else:
-            # For other file types, we would use specialized libraries
-            # For now, return a placeholder message
-            return f"[Text extracted from {file_extension} file]"
-    
-    def _split_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-        """
-        Split text into chunks.
-        
-        Args:
-            text: The text to split
-            chunk_size: Maximum chunk size in characters
-            overlap: Overlap between chunks in characters
-            
-        Returns:
-            List[str]: List of text chunks
+            List[str]: List of chunks
         """
         chunks = []
         
-        if len(text) <= chunk_size:
-            chunks.append(text)
-        else:
-            start = 0
-            while start < len(text):
-                end = min(start + chunk_size, len(text))
+        # Split content into paragraphs
+        paragraphs = [p for p in content.split('\n\n') if p.strip()]
+        
+        current_chunk = ""
+        for paragraph in paragraphs:
+            # If adding this paragraph would exceed chunk size, save current chunk and start a new one
+            if len(current_chunk) + len(paragraph) > self.chunk_size:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
                 
-                # Try to find a good break point
-                if end < len(text):
-                    # Look for paragraph break
-                    paragraph_break = text.rfind("\n\n", start, end)
-                    if paragraph_break != -1 and paragraph_break > start + chunk_size // 2:
-                        end = paragraph_break + 2
-                    else:
-                        # Look for line break
-                        line_break = text.rfind("\n", start, end)
-                        if line_break != -1 and line_break > start + chunk_size // 2:
-                            end = line_break + 1
-                        else:
-                            # Look for sentence break
-                            sentence_break = text.rfind(". ", start, end)
-                            if sentence_break != -1 and sentence_break > start + chunk_size // 2:
-                                end = sentence_break + 2
-                
-                chunks.append(text[start:end])
-                start = end - overlap
+                # Start new chunk with overlap from previous chunk if possible
+                if current_chunk and self.chunk_overlap > 0:
+                    words = current_chunk.split()
+                    overlap_words = words[-min(len(words), self.chunk_overlap):]
+                    current_chunk = ' '.join(overlap_words) + '\n\n' + paragraph
+                else:
+                    current_chunk = paragraph
+            else:
+                # Add paragraph to current chunk
+                if current_chunk:
+                    current_chunk += '\n\n' + paragraph
+                else:
+                    current_chunk = paragraph
+        
+        # Add the last chunk if it's not empty
+        if current_chunk:
+            chunks.append(current_chunk.strip())
         
         return chunks
     
-    async def _generate_embeddings(self, chunks: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for text chunks.
-        
-        Args:
-            chunks: List of text chunks
-            
-        Returns:
-            List[List[float]]: List of embeddings
-        """
-        # In a real implementation, this would call an embedding API
-        # For now, we'll return placeholder embeddings
-        
-        # Simulate embeddings with random vectors
-        embeddings = []
-        for _ in chunks:
-            # Generate a random 1536-dimensional vector (common for embeddings)
-            embedding = np.random.randn(1536).tolist()
-            embeddings.append(embedding)
-        
-        return embeddings
-    
-    async def _generate_query_embedding(self, query: str) -> List[float]:
-        """
-        Generate embedding for a query.
-        
-        Args:
-            query: The query string
-            
-        Returns:
-            List[float]: Query embedding
-        """
-        # In a real implementation, this would call an embedding API
-        # For now, we'll return a placeholder embedding
-        
-        # Simulate embedding with a random vector
-        return np.random.randn(1536).tolist()
-    
-    async def _store_embeddings(self, document_id: str, chunks: List[str], embeddings: List[List[float]]) -> None:
-        """
-        Store embeddings in the vector database.
-        
-        Args:
-            document_id: ID of the document
-            chunks: List of text chunks
-            embeddings: List of embeddings
-        """
-        # In a real implementation, this would store embeddings in a vector database
-        # For now, we'll save them to a JSON file
-        
-        data = []
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            data.append({
-                "id": f"{document_id}_{i}",
-                "document_id": document_id,
-                "chunk_index": i,
-                "text": chunk,
-                "embedding": embedding
-            })
-        
-        # Save to file
-        file_path = os.path.join(self.vector_db_path, f"{document_id}.json")
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    
-    async def _retrieve_chunks(self, query_embedding: List[float], top_k: int) -> List[Dict[str, Any]]:
+    async def retrieve_relevant_chunks(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """
         Retrieve relevant chunks for a query.
         
         Args:
-            query_embedding: Query embedding
-            top_k: Number of top results to return
+            query: Query text
+            top_k: Number of chunks to retrieve
             
         Returns:
             List[Dict[str, Any]]: List of relevant chunks with metadata
         """
-        # In a real implementation, this would query a vector database
-        # For now, we'll return placeholder results
-        
-        results = []
-        
-        # List all embedding files
-        for file_name in os.listdir(self.vector_db_path):
-            if file_name.endswith(".json"):
-                file_path = os.path.join(self.vector_db_path, file_name)
+        try:
+            # Generate query embedding
+            query_embedding = await self.llm_service.generate_embeddings_async(query)
+            if not query_embedding:
+                return []
+            
+            # Get all chunks
+            all_chunks = self.db.query(DocumentChunk).all()
+            if not all_chunks:
+                return []
+            
+            # Calculate similarity scores
+            chunk_scores = []
+            for chunk in all_chunks:
+                if not chunk.embedding:
+                    continue
                 
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                # Calculate cosine similarity
+                similarity = self._cosine_similarity(query_embedding, chunk.embedding)
                 
-                for item in data:
-                    # Calculate similarity (simplified)
-                    similarity = 0.5 + np.random.random() * 0.5  # Random similarity between 0.5 and 1.0
-                    
-                    results.append({
-                        "text": item["text"],
-                        "similarity": similarity,
-                        "metadata": {
-                            "document_id": item["document_id"],
-                            "chunk_index": item["chunk_index"]
-                        }
-                    })
-        
-        # Sort by similarity and take top_k
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        return results[:top_k]
+                # Add to scores
+                chunk_scores.append({
+                    "chunk": chunk,
+                    "score": similarity
+                })
+            
+            # Sort by score and get top_k
+            chunk_scores.sort(key=lambda x: x["score"], reverse=True)
+            top_chunks = chunk_scores[:top_k]
+            
+            # Format results
+            results = []
+            for item in top_chunks:
+                chunk = item["chunk"]
+                document = self.document_repo.get_by_id(chunk.document_id)
+                
+                results.append({
+                    "chunk_id": chunk.id,
+                    "document_id": chunk.document_id,
+                    "document_name": document.filename if document else "Unknown",
+                    "content": chunk.content,
+                    "score": item["score"]
+                })
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving relevant chunks: {str(e)}")
+            return []
     
-    async def _generate_response(self, query: str, relevant_chunks: List[Dict[str, Any]]) -> str:
+    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
         """
-        Generate a response based on the query and relevant chunks.
+        Calculate cosine similarity between two vectors.
         
         Args:
-            query: The query string
-            relevant_chunks: List of relevant chunks
+            vec1: First vector
+            vec2: Second vector
             
         Returns:
-            str: Generated response
+            float: Cosine similarity
         """
-        # Format context from relevant chunks
-        context = "\n\n".join([f"[Document {i+1}]: {chunk['text']}" for i, chunk in enumerate(relevant_chunks)])
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
         
-        # Create prompt
-        prompt = f"""
-        Based on the following context, please answer the query.
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
         
-        Query: {query}
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
         
-        Context:
-        {context}
-        
-        Answer:
+        return dot_product / (norm1 * norm2)
+    
+    async def generate_augmented_response(self, query: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         """
+        Generate an augmented response for a query.
         
-        # Generate response using LLM
-        response = await self.llm_service.generate_response(
-            prompt=prompt,
-            max_tokens=500,
-            temperature=0.3
-        )
-        
-        return response
+        Args:
+            query: Query text
+            user_id: User ID for filtering documents
+            
+        Returns:
+            Dict[str, Any]: Augmented response
+        """
+        try:
+            # Retrieve relevant chunks
+            relevant_chunks = await self.retrieve_relevant_chunks(query, top_k=settings.RAG_TOP_K)
+            
+            if not relevant_chunks:
+                # No relevant chunks found, generate response without augmentation
+                response = await self.llm_service.generate_response_async(
+                    prompt=f"Question: {query}\n\nAnswer:",
+                    max_tokens=settings.RAG_MAX_TOKENS,
+                    temperature=settings.RAG_TEMPERATURE
+                )
+                
+                return {
+                    "query": query,
+                    "response": response,
+                    "sources": [],
+                    "augmented": False
+                }
+            
+            # Prepare context from chunks
+            context = "Context information:\n\n"
+            sources = []
+            
+            for i, chunk in enumerate(relevant_chunks):
+                context += f"[{i+1}] {chunk['content']}\n\n"
+                
+                # Add source
+                sources.append({
+                    "document_id": chunk["document_id"],
+                    "document_name": chunk["document_name"],
+                    "score": chunk["score"]
+                })
+            
+            # Generate augmented response
+            prompt = f"{context}\nQuestion: {query}\n\nAnswer based on the provided context:"
+            
+            response = await self.llm_service.generate_response_async(
+                prompt=prompt,
+                max_tokens=settings.RAG_MAX_TOKENS,
+                temperature=settings.RAG_TEMPERATURE
+            )
+            
+            return {
+                "query": query,
+                "response": response,
+                "sources": sources,
+                "augmented": True
+            }
+        except Exception as e:
+            logger.error(f"Error generating augmented response: {str(e)}")
+            
+            # Fallback to non-augmented response
+            try:
+                response = await self.llm_service.generate_response_async(
+                    prompt=f"Question: {query}\n\nAnswer:",
+                    max_tokens=settings.RAG_MAX_TOKENS,
+                    temperature=settings.RAG_TEMPERATURE
+                )
+            except Exception:
+                response = "I apologize, but I encountered an error processing your request. Please try again later."
+            
+            return {
+                "query": query,
+                "response": response,
+                "sources": [],
+                "augmented": False,
+                "error": str(e)
+            }

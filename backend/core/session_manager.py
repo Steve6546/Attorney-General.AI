@@ -1,258 +1,244 @@
 """
 Attorney-General.AI - Session Manager
 
-This module provides a service for managing user sessions and chat history.
-It handles storing and retrieving messages for conversations.
+This module implements the session manager for the Attorney-General.AI backend.
+It provides functionality for creating, managing, and retrieving chat sessions.
 """
 
-import uuid
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, Any, List, Optional, Union
+import uuid
 from datetime import datetime
-import json
-import os
-import sqlite3
-from pathlib import Path
+from sqlalchemy.orm import Session
 
-from backend.config.settings import settings
+from backend.data.models import User, Session as ChatSession, Message
+from backend.agenthub.legal_agent.agent import LegalAgent
+from backend.tools.legal_research_tool import LegalResearchTool
+from backend.tools.document_analysis_tool import DocumentAnalysisTool
+from backend.memory.memory_store import MemoryStore
+from backend.core.llm_service import LLMService
 
 logger = logging.getLogger(__name__)
 
 class SessionManager:
-    """Service for managing user sessions and chat history."""
+    """Session manager for chat sessions."""
     
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db: Session):
         """
         Initialize the session manager.
         
         Args:
-            db_path: Optional path to the SQLite database file
+            db: Database session
         """
-        self.db_path = db_path or settings.DATABASE_URL.replace("sqlite:///", "")
-        self._initialize_db()
+        self.db = db
+        self.active_agents = {}
+        self.llm_service = LLMService()
     
-    def _initialize_db(self):
-        """Initialize the SQLite database with required tables."""
-        # Create the directory if it doesn't exist
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-        
-        # Connect to the database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Create sessions table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        
-        # Create messages table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
-            session_id TEXT,
-            content TEXT,
-            role TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (session_id) REFERENCES sessions (id)
-        )
-        ''')
-        
-        # Commit changes and close connection
-        conn.commit()
-        conn.close()
-    
-    async def create_session(self, user_id: Optional[str] = None) -> str:
+    async def create_session(self, user_id: str, title: Optional[str] = None) -> ChatSession:
         """
-        Create a new session.
+        Create a new chat session.
         
         Args:
-            user_id: Optional user ID
+            user_id: User ID
+            title: Optional session title
             
         Returns:
-            str: The session ID
+            ChatSession: Created session
         """
+        # Generate session ID
         session_id = str(uuid.uuid4())
         
-        # Connect to the database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Insert new session
-        cursor.execute(
-            "INSERT INTO sessions (id, user_id) VALUES (?, ?)",
-            (session_id, user_id)
+        # Create session
+        session = ChatSession(
+            id=session_id,
+            user_id=user_id,
+            title=title or "New Session",
+            is_active=True
         )
         
-        # Commit changes and close connection
-        conn.commit()
-        conn.close()
+        # Add to database
+        self.db.add(session)
+        self.db.commit()
+        self.db.refresh(session)
         
-        return session_id
+        logger.info(f"Created session {session_id} for user {user_id}")
+        
+        return session
     
-    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    async def get_session(self, session_id: str) -> Optional[ChatSession]:
         """
         Get a session by ID.
         
         Args:
-            session_id: The session ID
+            session_id: Session ID
             
         Returns:
-            Optional[Dict[str, Any]]: The session data or None if not found
+            Optional[ChatSession]: Session if found, None otherwise
         """
-        # Connect to the database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Query the session
-        cursor.execute(
-            "SELECT id, user_id, created_at, updated_at FROM sessions WHERE id = ?",
-            (session_id,)
-        )
-        
-        # Fetch the result
-        result = cursor.fetchone()
-        
-        # Close connection
-        conn.close()
-        
-        # Return None if session not found
-        if not result:
-            return None
-        
-        # Return session data
-        return {
-            "id": result[0],
-            "user_id": result[1],
-            "created_at": result[2],
-            "updated_at": result[3]
-        }
+        return self.db.query(ChatSession).filter(ChatSession.id == session_id).first()
     
-    async def save_message(
-        self,
-        session_id: str,
-        content: str,
-        role: str,
-        message_id: Optional[str] = None
-    ) -> str:
+    async def get_agent(self, session_id: str) -> LegalAgent:
         """
-        Save a message to a session.
+        Get or create an agent for a session.
         
         Args:
-            session_id: The session ID
-            content: The message content
-            role: The message role (user/assistant/system)
-            message_id: Optional message ID
+            session_id: Session ID
             
         Returns:
-            str: The message ID
+            LegalAgent: Agent for the session
+            
+        Raises:
+            ValueError: If session not found
         """
-        # Generate message ID if not provided
-        if not message_id:
-            message_id = str(uuid.uuid4())
+        # Check if agent already exists
+        if session_id in self.active_agents:
+            return self.active_agents[session_id]
         
-        # Connect to the database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        # Get session
+        session = await self.get_session(session_id)
         
-        # Check if session exists
-        cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
-        session = cursor.fetchone()
-        
-        # Create session if it doesn't exist
         if not session:
-            cursor.execute(
-                "INSERT INTO sessions (id) VALUES (?)",
-                (session_id,)
-            )
+            raise ValueError(f"Session not found: {session_id}")
         
-        # Insert message
-        cursor.execute(
-            "INSERT INTO messages (id, session_id, content, role) VALUES (?, ?, ?, ?)",
-            (message_id, session_id, content, role)
+        # Create memory store
+        memory_store = MemoryStore(self.db, self.llm_service)
+        
+        # Create tools
+        tools = [
+            LegalResearchTool(self.llm_service),
+            DocumentAnalysisTool(self.llm_service)
+        ]
+        
+        # Create agent
+        agent = LegalAgent(
+            session_id=session_id,
+            llm_service=self.llm_service,
+            memory_store=memory_store,
+            tools=tools
         )
         
-        # Update session updated_at timestamp
-        cursor.execute(
-            "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (session_id,)
-        )
+        # Store agent
+        self.active_agents[session_id] = agent
         
-        # Commit changes and close connection
-        conn.commit()
-        conn.close()
+        logger.info(f"Created agent for session {session_id}")
         
-        return message_id
+        return agent
     
-    async def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+    async def delete_session(self, session_id: str) -> bool:
+        """
+        Delete a session.
+        
+        Args:
+            session_id: Session ID
+            
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        # Get session
+        session = await self.get_session(session_id)
+        
+        if not session:
+            return False
+        
+        # Delete messages
+        self.db.query(Message).filter(Message.session_id == session_id).delete()
+        
+        # Delete session
+        self.db.delete(session)
+        self.db.commit()
+        
+        # Remove agent if exists
+        if session_id in self.active_agents:
+            del self.active_agents[session_id]
+        
+        logger.info(f"Deleted session {session_id}")
+        
+        return True
+    
+    async def get_user_sessions(self, user_id: str) -> List[ChatSession]:
+        """
+        Get all sessions for a user.
+        
+        Args:
+            user_id: User ID
+            
+        Returns:
+            List[ChatSession]: User sessions
+        """
+        return self.db.query(ChatSession).filter(
+            ChatSession.user_id == user_id
+        ).order_by(ChatSession.updated_at.desc()).all()
+    
+    async def update_session_title(self, session_id: str, title: str) -> Optional[ChatSession]:
+        """
+        Update a session title.
+        
+        Args:
+            session_id: Session ID
+            title: New title
+            
+        Returns:
+            Optional[ChatSession]: Updated session, or None if not found
+        """
+        # Get session
+        session = await self.get_session(session_id)
+        
+        if not session:
+            return None
+        
+        # Update title
+        session.title = title
+        session.updated_at = datetime.utcnow()
+        
+        self.db.commit()
+        self.db.refresh(session)
+        
+        logger.info(f"Updated title for session {session_id}")
+        
+        return session
+    
+    async def get_session_messages(self, session_id: str) -> List[Message]:
         """
         Get all messages for a session.
         
         Args:
-            session_id: The session ID
+            session_id: Session ID
             
         Returns:
-            List[Dict[str, Any]]: The messages
+            List[Message]: Session messages
         """
-        # Connect to the database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Query messages
-        cursor.execute(
-            "SELECT id, content, role, created_at FROM messages WHERE session_id = ? ORDER BY created_at",
-            (session_id,)
-        )
-        
-        # Fetch results
-        results = cursor.fetchall()
-        
-        # Close connection
-        conn.close()
-        
-        # Return messages
-        return [
-            {
-                "id": row[0],
-                "content": row[1],
-                "role": row[2],
-                "created_at": row[3]
-            }
-            for row in results
-        ]
+        return self.db.query(Message).filter(
+            Message.session_id == session_id
+        ).order_by(Message.created_at.asc()).all()
     
-    async def delete_session(self, session_id: str) -> bool:
+    def cleanup_inactive_agents(self, max_inactive_time: int = 3600) -> int:
         """
-        Delete a session and all its messages.
+        Clean up inactive agents.
         
         Args:
-            session_id: The session ID
+            max_inactive_time: Maximum inactive time in seconds
             
         Returns:
-            bool: True if successful, False otherwise
+            int: Number of agents cleaned up
         """
-        try:
-            # Connect to the database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Delete messages
-            cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            
-            # Delete session
-            cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            
-            # Commit changes and close connection
-            conn.commit()
-            conn.close()
-            
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting session: {str(e)}")
-            return False
+        # Get current time
+        now = datetime.utcnow()
+        
+        # Find inactive sessions
+        inactive_sessions = self.db.query(ChatSession).filter(
+            (now - ChatSession.updated_at).total_seconds() > max_inactive_time
+        ).all()
+        
+        # Get session IDs
+        inactive_session_ids = [session.id for session in inactive_sessions]
+        
+        # Remove agents
+        count = 0
+        for session_id in list(self.active_agents.keys()):
+            if session_id in inactive_session_ids:
+                del self.active_agents[session_id]
+                count += 1
+        
+        logger.info(f"Cleaned up {count} inactive agents")
+        
+        return count

@@ -1,181 +1,355 @@
 """
-Attorney-General.AI - Legal Research Tool
+Legal Research Tool for Attorney-General.AI.
 
-This module implements a tool for performing legal research.
-It inherits from the BaseTool class and adds legal research functionality.
+This module provides functionality for legal research and case law search.
 """
 
-from typing import Dict, Any, Optional, List
 import logging
+import os
 import json
+import asyncio
+from typing import List, Dict, Any, Optional
 import aiohttp
+from bs4 import BeautifulSoup
 import re
 
+from backend.core.llm_service import LLMService
 from backend.tools.base_tool import BaseTool
+from backend.config.settings import settings
 
+# Configure logging
 logger = logging.getLogger(__name__)
 
 class LegalResearchTool(BaseTool):
-    """Tool for performing legal research."""
+    """Tool for legal research and case law search."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, llm_service: Optional[LLMService] = None):
         """
         Initialize the legal research tool.
         
         Args:
-            config: Optional configuration dictionary
+            llm_service: LLM service instance
         """
-        super().__init__(config)
-        self.name = "legal_research"
-        self.description = "Search for legal information, cases, or statutes based on a query."
-        self.parameters = {
-            "query": {
-                "type": "string",
-                "description": "The legal research query to search for."
-            },
-            "jurisdiction": {
-                "type": "string",
-                "description": "Optional jurisdiction to limit the search (e.g., 'US', 'UK', 'EU')."
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of results to return (default: 5)."
-            }
+        super().__init__(
+            name="legal_research",
+            description="Performs legal research on specific topics or questions, searches for relevant case law, statutes, and legal commentary."
+        )
+        self.llm_service = llm_service or LLMService()
+        
+        # API endpoints for legal research
+        self.api_endpoints = {
+            "case_law": settings.LEGAL_API_CASE_LAW_ENDPOINT,
+            "statutes": settings.LEGAL_API_STATUTES_ENDPOINT,
+            "commentary": settings.LEGAL_API_COMMENTARY_ENDPOINT
         }
-        self.required_parameters = ["query"]
+        
+        # API key for legal research
+        self.api_key = settings.LEGAL_API_KEY
+        
+        logger.info("Legal Research Tool initialized")
     
-    async def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def run(self, query: str, jurisdiction: str = "US", result_limit: int = 5, **kwargs) -> Dict[str, Any]:
         """
-        Execute the legal research tool with the given parameters.
+        Run legal research on a query.
         
         Args:
-            params: The parameters for the legal research
+            query: Research query
+            jurisdiction: Legal jurisdiction (e.g., US, UK, EU)
+            result_limit: Maximum number of results to return
             
         Returns:
-            Dict[str, Any]: The research results
+            Dict[str, Any]: Research results
         """
-        # Validate parameters
-        if not self.validate_params(params):
-            return {
-                "error": "Missing required parameter: 'query'"
-            }
-        
-        query = params.get("query", "")
-        jurisdiction = params.get("jurisdiction", "")
-        max_results = params.get("max_results", 5)
-        
-        # In a real implementation, this would connect to a legal database API
-        # For now, we'll simulate results
-        
         try:
-            # Simulate API call delay and processing
-            results = await self._simulate_legal_search(query, jurisdiction, max_results)
+            # Validate inputs
+            if not query:
+                return {
+                    "query": query,
+                    "jurisdiction": jurisdiction,
+                    "error": "Query cannot be empty"
+                }
             
+            # Normalize jurisdiction
+            jurisdiction = jurisdiction.upper()
+            
+            # Prepare results
+            results = {
+                "query": query,
+                "jurisdiction": jurisdiction,
+                "results": []
+            }
+            
+            # Determine if we need to use API or web search
+            if self.api_key and all(endpoint for endpoint in self.api_endpoints.values()):
+                # Use legal API
+                api_results = await self._search_legal_api(query, jurisdiction, result_limit)
+                results["results"] = api_results
+                results["source"] = "legal_api"
+            else:
+                # Fallback to web search
+                web_results = await self._search_legal_web(query, jurisdiction, result_limit)
+                results["results"] = web_results
+                results["source"] = "web_search"
+            
+            # Enhance results with LLM analysis if results are found
+            if results["results"]:
+                analysis = await self._analyze_results(query, results["results"])
+                results["analysis"] = analysis
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error in legal research: {str(e)}")
             return {
                 "query": query,
-                "jurisdiction": jurisdiction or "All",
-                "results": results,
-                "total_results_found": len(results)
-            }
-        except Exception as e:
-            logger.error(f"Error executing legal research: {str(e)}")
-            return {
-                "error": f"Failed to perform legal research: {str(e)}"
+                "jurisdiction": jurisdiction,
+                "error": f"Error performing legal research: {str(e)}",
+                "results": []
             }
     
-    async def _simulate_legal_search(self, query: str, jurisdiction: str, max_results: int) -> List[Dict[str, Any]]:
+    async def _search_legal_api(self, query: str, jurisdiction: str, result_limit: int) -> List[Dict[str, Any]]:
         """
-        Simulate a legal search (to be replaced with actual API integration).
+        Search legal API for results.
         
         Args:
-            query: The search query
-            jurisdiction: The jurisdiction filter
-            max_results: Maximum number of results
+            query: Research query
+            jurisdiction: Legal jurisdiction
+            result_limit: Maximum number of results
             
         Returns:
-            List[Dict[str, Any]]: Simulated search results
+            List[Dict[str, Any]]: API search results
         """
-        # This is a placeholder for actual API integration
-        # In a real implementation, this would call a legal database API
-        
-        # Simulate different results based on query keywords
         results = []
         
-        if "contract" in query.lower():
-            results.extend([
-                {
-                    "title": "Contract Law Principles",
-                    "source": "Legal Encyclopedia",
-                    "summary": "Overview of contract law principles including formation, consideration, and breach.",
-                    "relevance": 0.95
-                },
-                {
-                    "title": "Smith v. Jones (2020)",
-                    "source": "Supreme Court",
-                    "summary": "Landmark case establishing modern interpretation of implied contract terms.",
-                    "relevance": 0.87
-                }
-            ])
+        try:
+            # Prepare API request
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            # Search case law
+            if self.api_endpoints["case_law"]:
+                case_law_results = await self._api_request(
+                    self.api_endpoints["case_law"],
+                    {
+                        "query": query,
+                        "jurisdiction": jurisdiction,
+                        "limit": result_limit
+                    },
+                    headers
+                )
+                
+                if case_law_results and "results" in case_law_results:
+                    for result in case_law_results["results"]:
+                        results.append({
+                            "title": result.get("title", "Unknown Case"),
+                            "citation": result.get("citation", ""),
+                            "date": result.get("date", ""),
+                            "court": result.get("court", ""),
+                            "summary": result.get("summary", ""),
+                            "url": result.get("url", ""),
+                            "type": "case_law"
+                        })
+            
+            # Search statutes
+            if self.api_endpoints["statutes"]:
+                statutes_results = await self._api_request(
+                    self.api_endpoints["statutes"],
+                    {
+                        "query": query,
+                        "jurisdiction": jurisdiction,
+                        "limit": result_limit
+                    },
+                    headers
+                )
+                
+                if statutes_results and "results" in statutes_results:
+                    for result in statutes_results["results"]:
+                        results.append({
+                            "title": result.get("title", "Unknown Statute"),
+                            "code": result.get("code", ""),
+                            "section": result.get("section", ""),
+                            "text": result.get("text", ""),
+                            "url": result.get("url", ""),
+                            "type": "statute"
+                        })
+            
+            # Search legal commentary
+            if self.api_endpoints["commentary"]:
+                commentary_results = await self._api_request(
+                    self.api_endpoints["commentary"],
+                    {
+                        "query": query,
+                        "jurisdiction": jurisdiction,
+                        "limit": result_limit
+                    },
+                    headers
+                )
+                
+                if commentary_results and "results" in commentary_results:
+                    for result in commentary_results["results"]:
+                        results.append({
+                            "title": result.get("title", "Unknown Commentary"),
+                            "author": result.get("author", ""),
+                            "publication": result.get("publication", ""),
+                            "date": result.get("date", ""),
+                            "summary": result.get("summary", ""),
+                            "url": result.get("url", ""),
+                            "type": "commentary"
+                        })
+            
+            # Limit total results
+            return results[:result_limit]
+        except Exception as e:
+            logger.error(f"Error searching legal API: {str(e)}")
+            return []
+    
+    async def _api_request(self, endpoint: str, data: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Make an API request.
         
-        if "property" in query.lower():
-            results.extend([
-                {
-                    "title": "Property Rights and Limitations",
-                    "source": "Legal Treatise",
-                    "summary": "Comprehensive analysis of property rights, easements, and restrictions.",
-                    "relevance": 0.92
-                },
-                {
-                    "title": "Johnson v. Property Holdings LLC (2019)",
-                    "source": "Appeals Court",
-                    "summary": "Case regarding disputed property boundaries and survey requirements.",
-                    "relevance": 0.85
-                }
-            ])
+        Args:
+            endpoint: API endpoint
+            data: Request data
+            headers: Request headers
+            
+        Returns:
+            Dict[str, Any]: API response
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(endpoint, json=data, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        logger.error(f"API request failed with status {response.status}: {await response.text()}")
+                        return {}
+        except Exception as e:
+            logger.error(f"Error making API request: {str(e)}")
+            return {}
+    
+    async def _search_legal_web(self, query: str, jurisdiction: str, result_limit: int) -> List[Dict[str, Any]]:
+        """
+        Search web for legal information.
         
-        if "criminal" in query.lower() or "crime" in query.lower():
-            results.extend([
-                {
-                    "title": "Criminal Procedure Act",
-                    "source": "Statutory Law",
-                    "summary": "Legislation governing criminal procedures and rights of defendants.",
-                    "relevance": 0.93
-                },
-                {
-                    "title": "State v. Williams (2021)",
-                    "source": "Criminal Court",
-                    "summary": "Recent case interpreting standards for evidence admissibility in criminal trials.",
-                    "relevance": 0.89
-                }
-            ])
+        Args:
+            query: Research query
+            jurisdiction: Legal jurisdiction
+            result_limit: Maximum number of results
+            
+        Returns:
+            List[Dict[str, Any]]: Web search results
+        """
+        results = []
         
-        # If no specific matches, provide general legal resources
-        if not results:
-            results = [
-                {
-                    "title": "Legal Research Methodology",
-                    "source": "Legal Reference",
-                    "summary": "Guide to conducting effective legal research across various domains.",
-                    "relevance": 0.75
-                },
-                {
-                    "title": "Comprehensive Legal Dictionary",
-                    "source": "Legal Reference",
-                    "summary": "Definitions and explanations of legal terminology relevant to the query.",
-                    "relevance": 0.70
-                }
-            ]
+        try:
+            # Prepare search query
+            search_query = f"{query} legal {jurisdiction} law"
+            
+            # Use LLM to generate structured search results
+            # This is a fallback when no legal API is available
+            schema = {
+                "results": [
+                    {
+                        "title": "Title of the legal resource",
+                        "source": "Source name (e.g., court, publication)",
+                        "date": "Publication date if available",
+                        "summary": "Brief summary of the content",
+                        "url": "URL if available (or 'Not available')",
+                        "type": "Type of resource (case_law, statute, commentary, article)"
+                    }
+                ]
+            }
+            
+            # Generate structured results
+            prompt = f"""
+            You are a legal research assistant. Based on the query "{query}" for the jurisdiction "{jurisdiction}", 
+            provide {result_limit} relevant legal resources that would be helpful for this research.
+            
+            Include case law, statutes, and legal commentary where appropriate. For each resource, provide:
+            1. Title
+            2. Source (court, publication, etc.)
+            3. Date (if known)
+            4. Brief summary of relevance to the query
+            5. URL (if known, otherwise "Not available")
+            6. Type of resource (case_law, statute, commentary, article)
+            
+            Format your response as a structured JSON object.
+            """
+            
+            structured_results = await self.llm_service.generate_structured_output_async(
+                prompt=prompt,
+                output_schema=schema,
+                temperature=0.2
+            )
+            
+            if "results" in structured_results:
+                results = structured_results["results"]
+            
+            return results[:result_limit]
+        except Exception as e:
+            logger.error(f"Error searching legal web: {str(e)}")
+            return []
+    
+    async def _analyze_results(self, query: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Analyze research results using LLM.
         
-        # Apply jurisdiction filter if specified
-        if jurisdiction:
-            jurisdiction_lower = jurisdiction.lower()
-            results = [
-                result for result in results 
-                if jurisdiction_lower in result.get("source", "").lower() or 
-                jurisdiction_lower in result.get("title", "").lower() or
-                jurisdiction_lower in result.get("summary", "").lower()
-            ]
-        
-        # Sort by relevance and limit results
-        results.sort(key=lambda x: x.get("relevance", 0), reverse=True)
-        return results[:max_results]
+        Args:
+            query: Original query
+            results: Research results
+            
+        Returns:
+            Dict[str, Any]: Analysis of results
+        """
+        try:
+            # Prepare results summary
+            results_summary = ""
+            for i, result in enumerate(results):
+                results_summary += f"[{i+1}] {result.get('title', 'Unknown')}\n"
+                if "citation" in result:
+                    results_summary += f"Citation: {result['citation']}\n"
+                if "court" in result:
+                    results_summary += f"Court: {result['court']}\n"
+                if "date" in result:
+                    results_summary += f"Date: {result['date']}\n"
+                if "summary" in result:
+                    results_summary += f"Summary: {result['summary']}\n"
+                results_summary += "\n"
+            
+            # Define analysis schema
+            analysis_schema = {
+                "key_principles": ["List of key legal principles identified"],
+                "relevance": "Assessment of how relevant the results are to the query",
+                "gaps": ["Potential gaps in the research"],
+                "recommendations": ["Recommendations for further research"]
+            }
+            
+            # Generate analysis
+            prompt = f"""
+            You are a legal research analyst. Analyze the following legal research results for the query: "{query}"
+            
+            Research Results:
+            {results_summary}
+            
+            Provide an analysis that includes:
+            1. Key legal principles identified in these results
+            2. Assessment of how relevant these results are to the original query
+            3. Potential gaps in the research that should be addressed
+            4. Recommendations for further research
+            
+            Format your response as a structured JSON object.
+            """
+            
+            analysis = await self.llm_service.generate_structured_output_async(
+                prompt=prompt,
+                output_schema=analysis_schema,
+                temperature=0.3
+            )
+            
+            return analysis
+        except Exception as e:
+            logger.error(f"Error analyzing results: {str(e)}")
+            return {
+                "error": f"Error analyzing results: {str(e)}"
+            }

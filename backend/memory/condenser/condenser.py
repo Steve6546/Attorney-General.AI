@@ -6,150 +6,169 @@ It provides functionality for condensing and summarizing memory items.
 """
 
 import logging
-from typing import Dict, Any, List, Optional
-import asyncio
-import json
+from typing import List, Dict, Any, Optional, Union
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
 
+from backend.data.models import MemoryItem, Session as ChatSession
 from backend.core.llm_service import LLMService
+from backend.memory.memory_store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
 class MemoryCondenser:
-    """Memory condenser for summarizing and condensing memory."""
+    """Memory condenser for summarizing and managing memory."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, db: Session, llm_service: Optional[LLMService] = None, memory_store: Optional[MemoryStore] = None):
         """
         Initialize the memory condenser.
         
         Args:
-            config: Optional configuration dictionary
+            db: Database session
+            llm_service: Optional LLM service for generating summaries
+            memory_store: Optional memory store for accessing memories
         """
-        self.config = config or {}
-        self.llm_service = LLMService()
+        self.db = db
+        self.llm_service = llm_service or LLMService()
+        self.memory_store = memory_store or MemoryStore(db, self.llm_service)
     
-    async def condense_conversation(self, messages: List[Dict[str, Any]]) -> str:
+    async def condense_session_memories(self, session_id: str, max_items: int = 10) -> Optional[MemoryItem]:
         """
-        Condense a conversation into a summary.
+        Condense short-term memories into a long-term memory summary.
         
         Args:
-            messages: List of conversation messages
+            session_id: Session ID
+            max_items: Maximum number of items to condense
             
         Returns:
-            str: The condensed summary
+            Optional[MemoryItem]: Created summary memory item, or None if no memories to condense
         """
-        if not messages:
-            return ""
+        # Get short-term memories for the session
+        memories = self.db.query(MemoryItem).filter(
+            MemoryItem.session_id == session_id,
+            MemoryItem.memory_type == "short_term"
+        ).order_by(
+            MemoryItem.importance.desc(),
+            MemoryItem.created_at.desc()
+        ).limit(max_items).all()
         
-        # Format messages for the LLM
-        formatted_messages = "\n".join([
-            f"{msg.get('role', 'unknown')}: {msg.get('content', '')}"
-            for msg in messages
-        ])
+        if not memories:
+            logger.debug(f"No memories to condense for session: {session_id}")
+            return None
         
-        # Create prompt for condensing
+        # Format memories for summarization
+        memory_texts = [f"- {memory.content} (Importance: {memory.importance:.2f})" for memory in memories]
+        memories_text = "\n".join(memory_texts)
+        
+        # Create prompt for summarization
         prompt = f"""
-        Below is a conversation between a user and a legal assistant.
-        Please summarize the key points of this conversation, focusing on:
-        1. The main legal questions or issues raised
-        2. Any important facts or context provided
-        3. The advice or information given
-        4. Any unresolved questions or next steps
-
-        Conversation:
-        {formatted_messages}
-
-        Summary:
+        Summarize the following conversation memories into a concise summary that captures the most important information:
+        
+        {memories_text}
+        
+        Provide a concise summary that captures the key points and important details.
         """
         
-        # Generate summary using LLM
-        try:
-            summary = await self.llm_service.generate_response(
-                prompt=prompt,
-                max_tokens=500,
-                temperature=0.3
-            )
-            
-            return summary
-        except Exception as e:
-            logger.error(f"Error condensing conversation: {str(e)}")
-            return "Error generating conversation summary."
+        # Generate summary
+        summary = await self.llm_service.generate_response_async(
+            prompt=prompt,
+            max_tokens=300,
+            temperature=0.5
+        )
+        
+        # Create long-term memory with the summary
+        summary_memory = await self.memory_store.add_memory(
+            session_id=session_id,
+            content=summary,
+            importance=0.8,  # High importance for summaries
+            memory_type="long_term"
+        )
+        
+        logger.info(f"Created memory summary for session {session_id}: {summary_memory.id}")
+        
+        return summary_memory
     
-    async def extract_key_information(self, text: str, info_type: str) -> Dict[str, Any]:
+    async def should_condense_memories(self, session_id: str, threshold: int = 20) -> bool:
         """
-        Extract key information from text.
+        Determine if memories should be condensed based on count.
         
         Args:
-            text: The text to extract information from
-            info_type: The type of information to extract (e.g., 'legal_entities', 'dates', 'legal_concepts')
+            session_id: Session ID
+            threshold: Threshold count for condensing
             
         Returns:
-            Dict[str, Any]: The extracted information
+            bool: True if memories should be condensed
         """
-        # Create prompt based on information type
-        if info_type == "legal_entities":
-            prompt = f"""
-            Please extract all legal entities (people, organizations, locations) from the following text.
-            Return the results as a JSON object with keys for 'people', 'organizations', and 'locations'.
-
-            Text:
-            {text}
-
-            JSON:
-            """
-        elif info_type == "dates":
-            prompt = f"""
-            Please extract all dates, deadlines, and time periods mentioned in the following text.
-            Return the results as a JSON object with keys for 'dates', 'deadlines', and 'time_periods'.
-
-            Text:
-            {text}
-
-            JSON:
-            """
-        elif info_type == "legal_concepts":
-            prompt = f"""
-            Please extract all legal concepts, principles, and terminology from the following text.
-            Return the results as a JSON object with keys for 'concepts', 'principles', and 'terminology'.
-
-            Text:
-            {text}
-
-            JSON:
-            """
-        else:
-            prompt = f"""
-            Please extract key information from the following text.
-            Return the results as a JSON object with appropriate keys.
-
-            Text:
-            {text}
-
-            JSON:
-            """
+        # Count short-term memories
+        count = self.db.query(MemoryItem).filter(
+            MemoryItem.session_id == session_id,
+            MemoryItem.memory_type == "short_term"
+        ).count()
         
-        # Generate extraction using LLM
-        try:
-            extraction_result = await self.llm_service.generate_response(
-                prompt=prompt,
-                max_tokens=1000,
-                temperature=0.2
-            )
+        return count >= threshold
+    
+    async def cleanup_old_memories(self, days_old: int = 30) -> int:
+        """
+        Clean up old short-term memories.
+        
+        Args:
+            days_old: Age in days for memories to be considered old
             
-            # Parse JSON result
-            try:
-                # Find JSON in the response
-                json_start = extraction_result.find('{')
-                json_end = extraction_result.rfind('}') + 1
-                
-                if json_start >= 0 and json_end > json_start:
-                    json_str = extraction_result[json_start:json_end]
-                    return json.loads(json_str)
-                else:
-                    return {"error": "No valid JSON found in extraction result"}
-            except json.JSONDecodeError:
-                logger.error("Failed to parse JSON from extraction result")
-                return {"error": "Failed to parse extraction result as JSON"}
-                
-        except Exception as e:
-            logger.error(f"Error extracting information: {str(e)}")
-            return {"error": f"Error extracting information: {str(e)}"}
+        Returns:
+            int: Number of deleted memories
+        """
+        cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+        
+        # Delete old short-term memories
+        result = self.db.query(MemoryItem).filter(
+            MemoryItem.memory_type == "short_term",
+            MemoryItem.created_at < cutoff_date
+        ).delete()
+        
+        self.db.commit()
+        
+        logger.info(f"Cleaned up {result} old memory items")
+        
+        return result
+    
+    async def generate_session_summary(self, session_id: str) -> str:
+        """
+        Generate a summary of a session from its memories.
+        
+        Args:
+            session_id: Session ID
+            
+        Returns:
+            str: Session summary
+        """
+        # Get all memories for the session
+        memories = self.db.query(MemoryItem).filter(
+            MemoryItem.session_id == session_id
+        ).order_by(
+            MemoryItem.created_at.asc()
+        ).all()
+        
+        if not memories:
+            return "No memories found for this session."
+        
+        # Format memories for summarization
+        memory_texts = [f"- {memory.content}" for memory in memories]
+        memories_text = "\n".join(memory_texts)
+        
+        # Create prompt for summarization
+        prompt = f"""
+        Generate a comprehensive summary of the following conversation:
+        
+        {memories_text}
+        
+        Provide a detailed summary that captures the key points, questions asked, information provided, and conclusions reached.
+        """
+        
+        # Generate summary
+        summary = await self.llm_service.generate_response_async(
+            prompt=prompt,
+            max_tokens=500,
+            temperature=0.5
+        )
+        
+        return summary
